@@ -11,3 +11,4 @@ The population distribution of the variable of interest (user's choice) is shown
 - [ ] New tab with exercise that explorates of the Central Limit Theorem
 - [ ] Include option to add normal curve "predicted" based on the population
 - [ ] Include demo data based on the Framingham Heart Study data
+
