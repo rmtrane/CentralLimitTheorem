@@ -24,6 +24,8 @@ server <- function(input, output, session) {
     )
   }
   
+  source("prep_for_histograms.R")
+  
   ## Number of samples to create
   max_resamples <- 10000
   
@@ -37,11 +39,11 @@ server <- function(input, output, session) {
   
   ########################################
   #### Prepare data when real data is used
-  
   observeEvent(input$upload_data, {
     ## Read data
     RVs$data <- readr::read_csv(file = input$file$datapath) %>% 
-      mutate(row_number = row_number())
+      mutate(row_number = row_number()) %>% 
+      select(row_number, everything())
     
     ## List of all variables available
     RVs$all_vars <- colnames(RVs$data)
@@ -56,6 +58,26 @@ server <- function(input, output, session) {
     
     RVs$samples <- filter(RVs$samples, row_number() < 1)
     
+  })
+  
+  observeEvent(input$use_framingham, {
+    ## Read data
+    RVs$data <- readr::read_csv(file = './data/framingham.csv') %>% 
+      mutate(row_number = row_number()) %>% 
+      select(row_number, everything())
+    
+    ## List of all variables available
+    RVs$all_vars <- colnames(RVs$data)
+    
+    ## Keep track of real/simulate status
+    RVs$real_simulated <- input$real_simulated
+    
+    ## "Delete" samples in case a user wants to start over.
+    if(!"samples" %in% names(RVs)){
+      RVs$samples <- tibble(i = 1)
+    }
+    
+    RVs$samples <- filter(RVs$samples, row_number() < 1)
   })
   
   #### Prepare data when simulated data is used
@@ -81,6 +103,14 @@ server <- function(input, output, session) {
       }
     })
   
+  ## Plot PDF of distribution chosen
+  output$PDF <- renderPlot({
+    X <- do.call(eval(parse(text = paste0("function(...) ", input$distribution, "(...)"))),
+                 args = setNames(map(names(RVs$X_args), function(x) input[[x]]), 
+                                 names(RVs$X_args)))
+    plot_pdf(X)
+  })
+
   ## When button "Genrate Population Data" is clicked, simulate a population
   observeEvent(input$generate_pop_data, {
     
@@ -114,6 +144,8 @@ server <- function(input, output, session) {
     
   })
   
+  
+  
   ##########################################
   #### Prepare data table with population data
   output$dataTable <- renderDataTable({
@@ -129,7 +161,7 @@ server <- function(input, output, session) {
   
   ## UI element to select ID variable
   output$select_id <- renderUI({
-    if(input$upload_data > 0 & input$real_simulated == "real"){
+    if((input$upload_data > 0 | input$use_framingham > 0) & input$real_simulated != "simulate"){
       fluidRow(
         column(
           12,
@@ -156,7 +188,8 @@ server <- function(input, output, session) {
     list(input$selected_var,
          input$statistic,
          input$generate_pop_data,
-         input$upload_data)
+         input$upload_data,
+         input$use_framingham)
   })
   
   ## When selected variable, or statistic is changed, delete previously generated samples
@@ -172,9 +205,9 @@ server <- function(input, output, session) {
   })
   
   observeEvent(calc_stat(), {
-    if((input$upload_data > 0 & !is.null(input$selected_var)) | input$generate_pop_data > 0 ){
+    if((input$upload_data + input$use_framingham > 0 & !is.null(input$selected_var)) | input$generate_pop_data > 0 ){
       ## If real data is used, keep track of selected variable
-      if(input$real_simulated == 'real'){
+      if(input$real_simulated != 'simulate'){
         RVs$selected_var <- input$selected_var
         RVs$selected_id <- input$selected_id
       }
@@ -199,7 +232,7 @@ server <- function(input, output, session) {
   
   ## Create histogram of entire population data
   output$population_distribution <- renderPlotly({
-    if((input$upload_data > 0 & !is.null(input$selected_var)) | input$generate_pop_data > 0){
+    if((input$upload_data + input$use_framingham > 0 & !is.null(input$selected_var)) | input$generate_pop_data > 0){
       plot_ly(data = RVs$data,
               x = as.formula(paste("~", RVs$selected_var)),
               #key = ~id,
@@ -238,8 +271,26 @@ server <- function(input, output, session) {
     RVs$statistic_values <- RVs$samples %>% 
       group_by(i) %>% 
       summarise(sum_stat = RVs$stat_func(!!sym(RVs$selected_var)),
+                errors = sd(!!sym(RVs$selected_var))*1.96/sqrt(input$sample_size),
                 ids_included = paste(!!sym(RVs$selected_id), collapse = ', ')) %>% 
-      ungroup()
+      ungroup() %>% 
+      mutate(covers = case_when(RVs$true_value < sum_stat + errors & RVs$true_value > sum_stat - errors ~ "yes",
+                               TRUE ~ "no"))
+      # mutate(CI_lower = sum_stat - 1.96*sds/sqrt(input$sample_size),
+      #        CI_lower = sum_stat + 1.96*sds/sqrt(input$sample_size))
+    
+    RVs$stat_values_as_datatable <- as.data.table(RVs$statistic_values)
+    
+    #write_rds(x = RVs$statistic_values, path = "statistic_values.Rds")
+    
+    RVs$for_histogram <- prep_for_hist(sim_data = RVs$statistic_values, 
+                                       sample_size = input$sample_size)
+    
+    # for (i in 1:length(RVs)){
+    #   write_rds(RVs[[names(RVs)[i]]], path=paste0("data/RVs/", names(RVs)[i], ".Rds"))  
+    # }
+    
+    
     print("toc")
     tictoc::toc()
     
@@ -257,7 +308,7 @@ server <- function(input, output, session) {
         sliderInput(inputId = "N", 
                     label = "Number of samples",
                     min = 1, max = max_resamples, value = 1, step = 1, 
-                    animate = animationOptions(interval = 250))
+                    animate = animationOptions(interval = 350))
       } else {
         actionButton(inputId = "generate_samples",
                      label = "Let's begin")
@@ -271,28 +322,87 @@ server <- function(input, output, session) {
     if(!is.null(input$N) & 
        (sum(RVs$samples$i == 1) == input$sample_size) & 
        (RVs$input_stat == input$statistic) ){ #&
-        (input$generate_samples > 0)
+        # (input$generate_samples > 0)
       
+      # plot_ly(
+      #   data = RVs$stat_values_as_datatable[i <= input$N,],
+      #   x = ~sum_stat,
+      #   type = 'histogram',
+      #   histnorm = 'probability density'
+      # ) %>% 
+      #   add_trace(
+      #     x = ~sum_stat,
+      #     y = 0,
+      #     type = 'scatter',
+      #     mode = 'markers'
+      #   ) %>% 
+      #   layout(
+      #     xaxis = RVs$xaxis,
+      #     shapes = list(vline(RVs$true_value),
+      #                   vline(x = RVs$stat_values_as_datatable[i == input$N, sum_stat], color = 'blue')),
+      #     showlegend = FALSE
+      #   )
       
-      RVs$statistic_values %>%
-        filter(i <= input$N) %>% 
-        plot_ly(
-          x = ~sum_stat,
-          type = 'histogram',
-          histnorm = 'probability density'
-        ) %>% 
+      plot_ly(data = RVs$for_histogram$for_histogram[i == input$N,]) %>% 
         add_trace(
-          x = ~sum_stat,
-          y = 0,
-          type = 'scatter',
-          mode = 'markers'
+          x = ~bin_center,
+          y = ~cumsum/i,
+          type = 'bar',
+          width = RVs$for_histogram$bin_width
         ) %>% 
         layout(
+          bargap = 0,
           xaxis = RVs$xaxis,
           shapes = list(vline(RVs$true_value),
-                        vline(x = filter(RVs$statistic_values, i == input$N)$sum_stat, color = 'blue')),
+                        vline(x = RVs$stat_values_as_datatable[i == input$N, sum_stat], color = 'blue')),
           showlegend = FALSE
         )
     } 
   })
+  
+  ## Display 95% CIs IF statistic is 'mean'
+  # output$CIs <- renderPlotly({
+  #   if(!is.null(input$N) &
+  #      (sum(RVs$samples$i == 1) == input$sample_size) &
+  #      (RVs$input_stat == input$statistic) &
+  #      (RVs$input_stat == "mean")){ #&
+  #     #(input$generate_samples > 0)
+  # 
+  # 
+  #     plot_ly(
+  #       data = RVs$stat_values_as_datatable[i <= input$N,],
+  #       x = ~sum_stat,
+  #       y = ~i,
+  #       type = 'scatter',
+  #       color = ~covers,
+  #       error_x = ~list(array = errors)
+  #     ) %>%
+  #       layout(
+  #         # xaxis = RVs$xaxis,
+  #         yaxis = list(range = c(max(input$N-50, 0), max(input$N, 50))),
+  #         shapes = list(vline(RVs$true_value)),
+  #         #               vline(x = filter(RVs$statistic_values, i == input$N)$sum_stat, color = 'blue')),
+  #         showlegend = FALSE
+  #       )
+  #   }
+  # })
+
+  ## Create UI element to select and show specific sample
+  output$select_sample_to_show <- renderUI({
+    numericInput("select_sample_to_show",
+                 label = "Select Sample to Show",
+                 value = 1,
+                 min = 1, max = input$N,
+                 step = 1)
+  })
+  
+  observeEvent(input$show_sample, {
+    RVs$sample_to_show <- RVs$samples %>% filter(i == input$select_sample_to_show)
+  })
+  
+  output$sample_to_show <- renderDataTable({
+    RVs$sample_to_show
+  })
+  
+  
 }
